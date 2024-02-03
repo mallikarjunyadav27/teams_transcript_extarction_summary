@@ -1,11 +1,8 @@
 import streamlit as st
 from langchain_community.utilities.sql_database import SQLDatabase
-from langchain_core.prompts.chat import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.prompts.chat import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.chat_history import BaseChatMessageHistory
 import psycopg2
 from llm import *
 
@@ -20,8 +17,6 @@ uri = f"postgresql+psycopg2://{username}:{password}@{host}/{database}"
 
 sqldb = SQLDatabase.from_uri(uri)
 
-# Create persistent chat history storage
-chat_history = BaseChatMessageHistory()
 
 # tag::write_message[]
 def write_message(role, content):
@@ -37,10 +32,8 @@ def write_message(role, content):
 
 # tag::generate_response[]
 def generate_response(user_question):
-    # Chat history is automatically handled within final_chain
-    standardised_question = final_chain.invoke({"question": user_question})
     
-     
+    standardised_question = user_question
 
     ############## Standardize user question #######################
     # TODO: Implement memory to get the standardised question
@@ -51,49 +44,46 @@ def generate_response(user_question):
     #End of TODO
     ################################################################
    
-    # This chain reformulates questions based on chat history if needed
-    contextualize_q_chain = (
-    ChatPromptTemplate.from_template(
-        """Given the chat history and the latest user question, reformulate the question \
-        to be standalone and understandable without the chat history. Do NOT answer the question, \
-        just reformulate it if needed and otherwise return it as is."""
-    )
-    | MessagesPlaceholder(variable_name="chat_history")  # Placeholder for chat history
-    | HumanMessage(content="{question}")  # User's question
-    | llm  # Use the language model to process and reformulate
-    | StrOutputParser() )
-
-    sqlquery = contextualize_q_chain.invoke({"question": standardised_question})
-
-    # This chain handles the overall question-answering process
-    qa_prompt = ChatPromptTemplate.from_template(
-    """Based on the table schema below, question, sql query, and sql response, write a natural language response:
+    sql_template = """Based on the table schema below, write a SQL query to answer the user's question:
     {schema}
 
-    ... (rest of the prompt template)
+    Question: {question}
+    SQL Query: """
 
-    {chat_history}  # Placeholder for chat history
+    prompt = ChatPromptTemplate.from_template(sql_template)
+    model = llm
+
+    sql_chain = (
+        RunnablePassthrough.assign(schema=get_schema)
+        | prompt
+        | model.bind(stop=["\nSQLResult:"])
+        | StrOutputParser()
+    )
+
+    sqlquery = sql_chain.invoke({"question": standardised_question})
+
+    template = """Based on the table schema below, question, sql query, and sql response, write a natural language response:
+    {schema}
+
+    If an exception happens, please say 
+    'I am unable to answer your question at this time'
+
+    If the query doesn't get any results, please say 
+    'No data found for your question at this time'
+
+    Always use LIKE operator for string columns when you prepare SQL queries. 
+
     Question: {question}
     SQL Query: {query}
-    SQL Response: {response} """)
-
-
+    SQL Response: {response} """
+    prompt_response = ChatPromptTemplate.from_template(template)
 
     final_chain = (
-    RunnableWithMessageHistory(  # Wrap the chain with chat history management
-        chat_history=chat_history,
-        chain=(
-            RunnablePassthrough.assign(
-                schema=get_schema,
-                response=lambda x: run_query(x["query"]),
-                question=lambda x: contextualize_q_chain.invoke(x) if x.get("chat_history") else x["question"],  # Conditionally use contextualize_q_chain
-            )
-            | qa_prompt
-            | llm
-            | StrOutputParser()
-        ),
+        RunnablePassthrough.assign(schema=get_schema, response=lambda x: run_query(x["query"]))
+        | prompt_response
+        | model
+        | StrOutputParser()
     )
-)
 
     response = "I am unable to answer your question at this time."
     if (str(sqlquery.upper()).startswith("SELECT")):
